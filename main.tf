@@ -5,7 +5,7 @@ terraform {
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-    }
+    }   
   }
 }
 
@@ -15,7 +15,7 @@ locals {
   cpu-request = "500m"
   memory-request = "1" 
   home-volume = "10Gi"
-  image = "kasmweb/core-rockylinux-9:1.16.0"
+  image = "marktmilligan/kasm:latest"
   user = "kasm-user"
   namespace = "coder"
 }
@@ -36,6 +36,14 @@ variable "use_kubeconfig" {
   for workspaces.  A valid "~/.kube/config" must be present on the Coder host.
   EOF
   default = false
+}
+
+variable "namespace" {
+  description = <<-EOF
+  Kubernetes namespace to deploy the workspace into
+
+  EOF
+  default = ""
 }
 
 data "coder_parameter" "dotfiles_url" {
@@ -92,35 +100,76 @@ resource "coder_agent" "coder" {
   }
 
   display_apps {
-    vscode = false
+    vscode = true
     vscode_insiders = false
-    ssh_helper = true
-    port_forwarding_helper = true
+    ssh_helper = false
+    port_forwarding_helper = false
     web_terminal = true
   }
 
-  env = {  
-  }
+  env = { 
+  
+    }
 
   startup_script_behavior = "blocking"
 
   startup_script = <<EOT
+
 #!/bin/bash
 
-# test
-echo "test" > /tmp/testfile
+# install and start the latest code-server
+curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/tmp/code-server
+/tmp/code-server/bin/code-server --auth none --port 13337 >/tmp/code-server.log 2>&1 &
 
-EOT
+# use coder CLI to clone and install dotfiles
+if [[ ! -z "${data.coder_parameter.dotfiles_url.value}" ]]; then
+  coder dotfiles -y ${data.coder_parameter.dotfiles_url.value}
+fi
+
+# start Kasm
+/dockerstartup/kasm_default_profile.sh
+/dockerstartup/vnc_startup.sh >/dev/null 2>&1 &
+
+# start Insomnia 
+insomnia >/dev/null 2>&1 &
+
+# change shell
+sudo chsh -s $(which bash) $(whoami) >/dev/null 2>&1 &
+
+  EOT 
 }
 
 resource "coder_app" "kasm" {
   agent_id      = coder_agent.coder.id
   slug          = "kasm"  
-  display_name  = "kasm"
+  display_name  = "KasmVNC"
   icon          = "https://avatars.githubusercontent.com/u/44181855?s=280&v=4"
-  url           = "https://localhost:6901"
+  url           = "http://localhost:6901"
+  subdomain = true
+  share     = "owner"
+
+  healthcheck {
+    url       = "http://localhost:6901/"
+    interval  = 5
+    threshold = 15
+  } 
+}
+
+# code-server
+resource "coder_app" "code-server" {
+  agent_id      = coder_agent.coder.id
+  slug          = "code-server"  
+  display_name  = "code-server"
+  icon          = "/icon/code.svg"
+  url           = "http://localhost:13337?folder=/home/${local.user}"
   subdomain = false
   share     = "owner"
+
+  healthcheck {
+    url       = "http://localhost:13337/healthz"
+    interval  = 3
+    threshold = 10
+  }  
 }
 
 resource "kubernetes_pod" "main" {
@@ -148,10 +197,6 @@ resource "kubernetes_pod" "main" {
       env {
         name  = "CODER_AGENT_TOKEN"
         value = coder_agent.coder.token
-      }
-      env {
-        name = "VNC_PW"
-        value = "password"
       }  
       resources {
         requests = {
